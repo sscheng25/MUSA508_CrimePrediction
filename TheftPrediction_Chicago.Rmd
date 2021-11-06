@@ -1,0 +1,776 @@
+---
+title: "MUSA 508 Assignment 3"
+subtitle: "Theft Prediction Model in Chicago"
+author: "Sisun Cheng"
+date: "2021/10/28"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+## 0. Introduction
+
+Theft is one of the most common crimes in our real world life. Theft often brings property lost and damage. Although most thefts do not harm one's life, thefts do cause a lot of trouble to individuals as well as the city manager. In this project, the city of Chicago is selected as study area, I will analyze the current theft data of Chicago, and try to predict thefts with a set of variables with the method of Poisson regression. All data used in this project come from Chicago Open Data site (https://data.cityofchicago.org/).
+
+Chicago is among the biggest cities in the US, locates in northeastern Illinois on the southwestern shores of Lake Michigan. In 2020, Chicago reaches a population of 2,746,388, and it is definitely a city worth exploring.
+
+```{r setup, include=FALSE}
+# set up
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+
+library(tidyverse)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+```
+
+## 1. Data Wrangling
+
+### Loading Chicago Data
+
+At the beginning, data of police districts, police beats, Chicago city boundary, and theft data are imported and visualized.
+
+```{r load Chicago data, results = 'hide' }
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/fthy-xz3r?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = dist_num)
+  
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/aerh-rz74?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = beat_num)
+
+bothPoliceUnits <- rbind(mutate(policeDistricts, Legend = "Police Districts"), 
+                         mutate(policeBeats, Legend = "Police Beats"))
+
+theft_chi <- 
+    read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2017/d62x-nvdr") %>% 
+    filter(Primary.Type == "THEFT" & Description =="OVER $500") %>%
+    dplyr::select(-Date, -Updated.On) %>%
+    mutate(x = gsub("[()]", "", Location)) %>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>% 
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+
+chicagoBoundary <- 
+  st_read(file.path(root.dir,"/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+```
+
+
+```{r visualize point data, fig.width=12, fig.height=8}
+
+grid.arrange(ncol=2,
+ggplot() + 
+  geom_sf(data = chicagoBoundary) +
+  geom_sf(data = theft_chi, colour="red", size=0.05, show.legend = "point") +
+  labs(title= "Thefts, Chicago - 2017") +
+  mapTheme(title_size = 14),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey40") +
+  stat_density2d(data = data.frame(st_coordinates(theft_chi)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Density of Thefts") +
+  mapTheme(title_size = 14) + theme(legend.position = "none"))
+```
+
+### Creating Fishnet Grids
+
+```{r create fishnet grids}
+fishnet <- 
+  st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%           
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+```
+
+According to the histogram of 'countThefts', the distribution of count Thefts is like Poisson distribution. So it is reasonable to use Poisson Regression in this project.
+
+```{r put crime data in the net}
+crime_net <- 
+  dplyr::select(theft_chi) %>% 
+  mutate(countThefts = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countThefts = replace_na(countThefts, 0),
+         uniqueID = rownames(.),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+ggplot() +
+  geom_sf(data = crime_net, aes(fill = countThefts), color = NA) +
+  scale_fill_viridis() +
+  labs(title = "Count of Thefts for the fishnet") +
+  mapTheme()
+
+# histogram of dependent variable
+ggplot(crime_net, aes(countThefts)) + 
+  geom_histogram(binwidth = 1, color = 'black', fill='white') +
+  labs(title = "Theft Distribution, Chicago")
+```
+
+### Adding Spatial Features
+
+I select a bunch of spatial features as the predictors, including abandoned cars, abandoned buildings, grafitti, street lights- out, sanitation complaints, liquor retails, street pot holes and traffic crash.
+
+```{r import variables,  results = 'hide' }
+# import variables
+abandonCars <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva") %>%
+  mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Abandoned_Cars")
+
+abandonBuildings <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Vacant-and-Abandoned-Building/7nii-7srd") %>%
+  mutate(year = substr(date_service_request_was_received,1,4)) %>%  filter(year == "2017") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Abandoned_Buildings")
+
+graffiti <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Graffiti-Removal-Historical/hec5-y4x5") %>%
+  mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+  filter(where_is_the_graffiti_located_ %in% c("Front", "Rear", "Side")) %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Graffiti")
+
+streetLightsOut <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") %>%
+  mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Street_Lights_Out")
+
+sanitation <-
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Sanitation-Code-Complaints-Hi/me59-5fac") %>%
+  mutate(year = substr(creation_date,1,4)) %>% filter(year == "2017") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Sanitation")
+
+liquorRetail <- 
+  read.socrata("https://data.cityofchicago.org/resource/nrmj-3kcf.json") %>%  
+  filter(business_activity == "Retail Sales of Packaged Liquor") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Liquor_Retail")
+
+PotHoles <- 
+  read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Pot-Holes-Reported-No-Duplica/bp3e-nw4d") %>%
+  mutate(year = substr(CREATION.DATE,1,4)) %>% filter(year == "2017") %>%
+  dplyr::select(Y = LATITUDE, X = LONGITUDE) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Pot_Holes")
+
+TrafficCrash <- 
+  read.socrata("https://data.cityofchicago.org/Transportation/Traffic-Crashes-Crashes/85ca-t3if") %>%
+  mutate(year = substr(crash_date,1,4)) %>% filter(year == "2017") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+  na.omit() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Traffic_Crash")
+
+neighborhoods <- 
+  st_read("https://raw.githubusercontent.com/blackmad/neighborhoods/master/chicago.geojson") %>%
+  st_transform(st_crs(fishnet)) 
+
+```
+
+## 2. Feature Engineering
+
+### Counting Risk Features in the Fishnet
+
+By joining the feature variables to the fishnet grid, it is possible to count the number of certain features occurred in each grid.
+
+```{r join features in net, results = 'hide' }
+# join features in net
+vars_net <- 
+  rbind(abandonCars,streetLightsOut,abandonBuildings,
+        liquorRetail, graffiti, sanitation, PotHoles, TrafficCrash) %>%
+  st_join(., fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+  full_join(fishnet) %>%
+  spread(Legend, count, fill=0) %>%
+  st_sf() %>%
+  dplyr::select(-`<NA>`) %>%
+  na.omit() %>%
+  ungroup()
+```
+
+
+```{r plot features in net, fig.height=16, fig.width=10}
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+    geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour=NA) +
+    scale_fill_viridis(name="") +
+    labs(title=i) +
+    mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol=3, top="Risk Factors by Fishnet"))
+```
+
+### Nearest Neighbor Features
+
+By doing the nearest neighbor calculation, I can get the distance of the nearest three features of each type. Nearest neighbor results are important predictors in the regression model.
+
+```{r add nearest neighbor features}
+# nearest neighbor features
+st_c <- st_coordinates
+st_coid <- st_centroid
+
+vars_net <-
+  vars_net %>%
+  mutate(
+    Abandoned_Buildings.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(abandonBuildings),3),
+    Abandoned_Cars.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(abandonCars),3),
+    Graffiti.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(graffiti),3),
+    Liquor_Retail.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(liquorRetail),3),
+    Street_Lights_Out.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(streetLightsOut),3),
+    Sanitation.nn =
+      nn_function(st_c(st_coid(vars_net)), st_c(sanitation),3),
+    Pot_Holes.nn =
+      nn_function(st_c(st_coid(vars_net)), na.omit(st_c(PotHoles)),3),
+    Traffic_Crash.nn =
+      nn_function(st_c(st_coid(vars_net)), na.omit(st_c(TrafficCrash)),3)
+    )
+```
+
+
+```{r plot nearest neighbor features, fig.height=16, fig.width=10 }
+# plot nearest neighbor features
+vars_net.long.nn <- 
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+  gather(Variable, value, -geometry)
+
+vars <- unique(vars_net.long.nn$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+    geom_sf(data = filter(vars_net.long.nn, Variable == i), aes(fill=value), colour=NA) +
+    scale_fill_viridis(name="") +
+    labs(title=i) +
+    mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol = 3, top = "Nearest Neighbor risk Factors by Fishnet"))
+```
+
+I also imported the distance to loop point as a spatial feature.
+
+```{r measure distance to loop point}
+# measure distance to loop point
+loopPoint <-
+  filter(neighborhoods, name == "Loop") %>%
+  st_centroid()
+
+vars_net$loopDistance =
+  st_distance(st_centroid(vars_net),loopPoint) %>%
+  as.numeric() 
+
+```
+
+
+```{r join and plot the final net, results = 'hide' }
+# join and plot the final net
+final_net <-
+  left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID") 
+
+final_net <-
+  st_centroid(final_net) %>%
+  st_join(dplyr::select(neighborhoods, name)) %>%
+  st_join(dplyr::select(policeDistricts, District)) %>%
+  st_drop_geometry() %>%
+  left_join(dplyr::select(final_net, geometry, uniqueID)) %>%
+  st_sf() %>%
+  na.omit()
+```
+
+## 3. Spatial Process
+
+### Moran's I Statistics
+
+In this section, local Moran's I is calculated and hotspots of theft are identified according to the Moran's I result.
+
+```{r calculate weight list}
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+```
+
+
+```{r Morans I, fig.height=10, fig.width=8}
+final_net.localMorans <- 
+  cbind(
+    as.data.frame(localmoran(final_net$countThefts, final_net.weights, zero.policy=TRUE)),
+    as.data.frame(final_net)) %>% 
+  st_sf() %>%
+  dplyr::select(Theft_Count = countThefts, 
+                Local_Morans_I = Ii, 
+                P_Value = `Pr(z != E(Ii))`) %>%
+  mutate(Significant_Hotspots = ifelse(P_Value <= 0.05, 1, 0)) %>%
+  gather(Variable, Value, -geometry)
+
+vars <- unique(final_net.localMorans$Variable)
+varList <- list()
+
+for(i in vars){
+  varList[[i]] <- 
+    ggplot() +
+    geom_sf(data = filter(final_net.localMorans, Variable == i), 
+            aes(fill = Value), colour=NA) +
+    scale_fill_viridis(name="") +
+    labs(title=i) +
+    mapTheme() + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(varList, ncol = 2, top = "Local Morans I statistics, Theft"))
+```
+ 
+
+```{r plot the final fishnet}
+# plot the final fishnet
+final_net <-
+  final_net %>% 
+  mutate(theft.isSig = 
+           ifelse(localmoran(final_net$countThefts, 
+                             final_net.weights, zero.policy=TRUE)[,5] <= 0.0000001, 1, 0)) %>%
+  mutate(theft.isSig.dist = 
+           nn_function(st_coordinates(st_centroid(final_net)),
+                       st_coordinates(st_centroid(
+                         filter(final_net, theft.isSig == 1))), 1))
+
+```
+
+### Correlation Test
+
+I tested the correlation between predictors and dependent variable. The result is shown as follows. Some of the predictors show a moderate correlation, while a few others seem to have weak relationship with the dependent variable.
+
+```{r correlation test, fig.height=20, fig.width=10}
+# correlation test
+correlation.long <-
+  st_drop_geometry(final_net) %>%
+  dplyr::select(-uniqueID, -cvID, -loopDistance, -name, -District) %>%
+  gather(Variable, Value, -countThefts)
+
+correlation.cor <-
+  correlation.long %>%
+  group_by(Variable) %>%
+  summarize(correlation = cor(Value, countThefts, use = "complete.obs"))
+
+# kable(correlation.cor)
+
+ggplot(correlation.long, aes(Value, countThefts)) +
+  geom_point(size = 0.1) +
+  geom_text(data = correlation.cor, aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black") +
+  facet_wrap(~Variable, ncol = 2, scales = "free") +
+  labs(title = "Theft count as a function of risk factors") +
+  plotTheme()
+
+```
+
+## 4. Poisson Regression
+
+Below is the listed variables for the regression. The first variable list contains only basic spatial features, and the second take significant crimehotspots into consideration.
+
+Variables list 1: "Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Graffiti.nn", "Liquor_Retail.nn", "Street_Lights_Out.nn", "Sanitation.nn", "Pot_Holes.nn", "Traffic_Crash.nn", "loopDistance"
+
+Variables list 2: "Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Graffiti.nn", "Liquor_Retail.nn", "Street_Lights_Out.nn", "Sanitation.nn", "Pot_Holes.nn", "Traffic_Crash.nn", "loopDistance", "theft.isSig", "theft.isSig.dist"
+
+```{r Poisson regression}
+# Poisson regression variables
+reg.vars <- c("Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Graffiti.nn", 
+              "Liquor_Retail.nn", "Street_Lights_Out.nn", "Sanitation.nn", 
+              "Pot_Holes.nn", "Traffic_Crash.nn", "loopDistance")
+
+reg.ss.vars <- c("Abandoned_Buildings.nn", "Abandoned_Cars.nn", "Graffiti.nn", 
+                 "Liquor_Retail.nn", "Street_Lights_Out.nn", "Sanitation.nn", 
+                 "Pot_Holes.nn", "Traffic_Crash.nn", "loopDistance", 
+                 "theft.isSig", "theft.isSig.dist")
+```
+
+### Cross Validated Poisson Regression
+
+```{r crossValidated fuction}
+crossValidate <- function(dataset, id, dependentVariable, indVariables) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <-
+      glm(countThefts ~ ., family = "poisson", 
+          data = fold.train %>% 
+            dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+```
+
+
+```{r cross validation, results = 'hide' , warning=FALSE}
+reg.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countThefts",
+  indVariables = reg.vars) %>%
+  dplyr::select(cvID = cvID, countThefts, Prediction, geometry)
+
+reg.ss.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countThefts",
+  indVariables = reg.ss.vars) %>%
+  dplyr::select(cvID = cvID, countThefts, Prediction, geometry)
+
+reg.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countThefts",
+  indVariables = reg.vars) %>%
+  dplyr::select(cvID = name, countThefts, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = final_net,
+  id = "name",
+  dependentVariable = "countThefts",
+  indVariables = reg.ss.vars) %>%
+  dplyr::select(cvID = name, countThefts, Prediction, geometry)
+```
+
+### Accuracy and Generalizability
+
+I measured the accuracy of the regression model, and the distribution of MAE is shown as follows.
+
+```{r regression summary}
+reg.summary <- 
+  rbind(
+    mutate(reg.cv,           Error = Prediction - countThefts,
+           Regression = "Random k-fold CV: Just Risk Factors"),
+    
+    mutate(reg.ss.cv,        Error = Prediction - countThefts,
+           Regression = "Random k-fold CV: Spatial Process"),
+    
+    mutate(reg.spatialCV,    Error = Prediction - countThefts,
+           Regression = "Spatial LOGO-CV: Just Risk Factors"),
+    
+    mutate(reg.ss.spatialCV, Error = Prediction - countThefts,
+           Regression = "Spatial LOGO-CV: Spatial Process")) %>%
+  st_sf() 
+```
+
+
+```{r error_by_reg_and_fold, fig.height=6, fig.width=10, results = 'hide'}
+error_by_reg_and_fold <- 
+  reg.summary %>%
+  group_by(Regression, cvID) %>% 
+  summarize(Mean_Error = mean(Prediction - countThefts, na.rm = T),
+            MAE = mean(abs(Mean_Error), na.rm = T),
+            SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+  geom_histogram(bins = 30, colour="black", fill = "#FDE725FF") +
+  facet_wrap(~Regression) +  
+  geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 8, by = 1)) + 
+  labs(title="Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+       x="Mean Absolute Error", y="Count") +
+  plotTheme()
+```
+
+As is shown in the table and plots below, Random k-fold has a better accuracy than spatial LOGO model, and the models with spatial process are more accurate than those with just risk factors.
+
+```{r error table}
+st_drop_geometry(error_by_reg_and_fold) %>%
+  group_by(Regression) %>% 
+  summarize(Mean_MAE = round(mean(MAE), 2),
+            SD_MAE = round(sd(MAE), 2)) %>%
+  kable() %>%
+  kable_styling("striped", full_width = F) %>%
+  row_spec(2, color = "black", background = "#FDE725FF") %>%
+  row_spec(4, color = "black", background = "#FDE725FF") 
+```
+
+
+```{r error plots}
+error_by_reg_and_fold %>%
+  filter(str_detect(Regression, "LOGO")) %>%
+  ggplot() +
+  geom_sf(aes(fill = MAE)) +
+  facet_wrap(~Regression) +
+  scale_fill_viridis() +
+  labs(title = "theft errors by LOGO-CV Regression") +
+  mapTheme() + theme(legend.position="bottom")
+
+```
+
+
+```{r neighborhood weights}
+neighborhood.weights <-
+  filter(error_by_reg_and_fold, Regression == "Spatial LOGO-CV: Spatial Process") %>%
+  group_by(cvID) %>%
+  poly2nb(as_Spatial(.), queen=TRUE) %>%
+  nb2listw(., style="W", zero.policy=TRUE)
+```
+
+The Moran's I of model with spatial process is also lower than that of just risk factors, which indicates a better generalizability.
+
+```{r filter}
+filter(error_by_reg_and_fold, str_detect(Regression, "LOGO"))  %>% 
+  st_drop_geometry() %>%
+  group_by(Regression) %>%
+  summarize(Morans_I = moran.mc(abs(Mean_Error), neighborhood.weights, 
+                                nsim = 999, zero.policy = TRUE, 
+                                na.action=na.omit)[[1]],
+            p_value = moran.mc(abs(Mean_Error), neighborhood.weights, 
+                               nsim = 999, zero.policy = TRUE, 
+                               na.action=na.omit)[[3]])
+```
+
+The predicted result is compared to the observed thefts. The following plot shows the difference between mean of predicted result and mean of observed thefts by theft decile.
+
+```{r Predicted and observed theft, fig.height=6, fig.width=10, results='hide'}
+st_drop_geometry(reg.summary) %>%
+  group_by(Regression) %>%
+  mutate(theft_Decile = ntile(countThefts, 10)) %>%
+  group_by(Regression, theft_Decile) %>%
+  summarize(meanObserved = mean(countThefts, na.rm=T),
+            meanPrediction = mean(Prediction, na.rm=T)) %>%
+  gather(Variable, Value, -Regression, -theft_Decile) %>%          
+  ggplot(aes(theft_Decile, Value, shape = Variable)) +
+  geom_point(size = 2) + geom_path(aes(group = theft_Decile), colour = "black") +
+  scale_shape_manual(values = c(2, 17)) +
+  facet_wrap(~Regression) + xlim(0,10) +
+  labs(title = "Predicted and observed theft by observed theft decile")  +
+  plotTheme()
+```
+
+ACS data is imported to divide the region into majority white and majority non white and test the generalizability.
+
+```{r Generalizability by census, results = 'hide' }
+tracts18 <- 
+  get_acs(geography = "tract", variables = c("B01001_001E","B01001A_001E"), 
+          year = 2018, state=17, county=031, geometry=T) %>%
+  st_transform('ESRI:102271')  %>% 
+  dplyr::select(variable, estimate, GEOID) %>%
+  spread(variable, estimate) %>%
+  rename(TotalPop = B01001_001,
+         NumberWhites = B01001A_001) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "Majority_White", "Majority_Non_White")) %>%
+  .[neighborhoods,]
+```
+
+In the model with just risk factors, there is a significant difference between white and non-white region in mean error, indicating a relatively poor generalizability. In the model with spatial process, the mean error of the two regions is very close to each other, indicating a much better generalizability.
+
+```{r white and non-white}
+reg.summary %>% 
+  filter(str_detect(Regression, "LOGO")) %>%
+  st_centroid() %>%
+  st_join(tracts18) %>%
+  na.omit() %>%
+  st_drop_geometry() %>%
+  group_by(Regression, raceContext) %>%
+  summarize(mean.Error = mean(Error, na.rm = T)) %>%
+  spread(raceContext, mean.Error) %>%
+  kable(caption = "Mean Error by neighborhood racial context") %>%
+  kable_styling("striped", full_width = F)  
+```
+
+### Kernel Density
+
+Hotspot is a widely used method in policing. The following plot is the kernel density of the thefts in 2017. The region of higher kernel density is the hotspot.
+
+```{r Kernel density of 2017}
+theft_ppp <- as.ppp(st_coordinates(theft_chi), W = st_bbox(final_net))
+theft_KD <- spatstat.core::density.ppp(theft_ppp, 1000)
+
+as.data.frame(theft_KD) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) %>%
+   ggplot() +
+     geom_sf(aes(fill=value)) +
+     geom_sf(data = sample_n(theft_chi, 1500), size = .5) +
+     scale_fill_viridis(name = "Density") +
+     labs(title = "Kernel density of 2017 thefts") +
+     mapTheme()
+```
+
+
+```{r theft18}
+theft18 <- 
+  read.socrata("https://data.cityofchicago.org/Public-Safety/Crimes-2018/3i3m-jwuy") %>% 
+  filter(Primary.Type == "THEFT" & 
+         Description == "OVER $500") %>%
+  dplyr::select(-Date, -Updated.On) %>%
+  mutate(x = gsub("[()]", "", Location)) %>%
+  separate(x,into= c("Y","X"), sep=",") %>%
+  mutate(X = as.numeric(X),
+         Y = as.numeric(Y)) %>% 
+  na.omit %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform('ESRI:102271') %>% 
+  distinct() %>%
+  .[fishnet,]
+```
+
+
+```{r ppp and kd}
+theft_ppp <- as.ppp(st_coordinates(theft_chi), W = st_bbox(final_net))
+theft_KD <- spatstat.core::density.ppp(theft_ppp, 1000)
+
+theft_KDE_sf <- as.data.frame(theft_KD) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = ntile(value, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 70 & Risk_Category <= 89 ~ "70% to 89%",
+           Risk_Category >= 50 & Risk_Category <= 69 ~ "50% to 69%",
+           Risk_Category >= 30 & Risk_Category <= 49 ~ "30% to 49%",
+           Risk_Category >= 1 & Risk_Category <= 29 ~ "1% to 29%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(theft18) %>% mutate(theftCount = 1), ., sum) %>%
+    mutate(theftCount = replace_na(theftCount, 0))) %>%
+  dplyr::select(label, Risk_Category, theftCount)
+```
+
+
+```{r theft_risk}
+theft_risk_sf <-
+  filter(reg.summary, Regression == "Spatial LOGO-CV: Spatial Process") %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category = ntile(Prediction, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 70 & Risk_Category <= 89 ~ "70% to 89%",
+           Risk_Category >= 50 & Risk_Category <= 69 ~ "50% to 69%",
+           Risk_Category >= 30 & Risk_Category <= 49 ~ "30% to 49%",
+           Risk_Category >= 1 & Risk_Category <= 29 ~ "1% to 29%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(theft18) %>% mutate(theftCount = 1), ., sum) %>%
+      mutate(theftCount = replace_na(theftCount, 0))) %>%
+  dplyr::select(label,Risk_Category, theftCount)
+```
+
+Comparing the model results with the prediction made with kernel density analysis, as is shown in the plot below, the Poisson regression model predicts the theft cases more accurately and precisely in spatial distribution than kernel density analysis. The model result matches better with the 2018 theft cases.
+
+```{r Comparison of Kernel Density and Risk Predictions}
+rbind(theft_KDE_sf, theft_risk_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    geom_sf(data = sample_n(theft18, 3000), size = .5, colour = "black") +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2017 theft risk predictions; 2018 thefts") +
+    mapTheme()
+```
+
+In general, the prediction made by both kernel density analysis and Poisson regression model is similar in value. There is slightly more cases predicted by kernel density analysis in the 70-100% percentile groups and less cases in less than 70% percentile groups.
+
+```{r Risk prediction and Kernel density barplot, results='hide'}
+rbind(theft_KDE_sf, theft_risk_sf) %>%
+  st_set_geometry(NULL) %>% na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countThefts = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Rate_of_test_set_crimes = countThefts / sum(countThefts)) %>%
+    ggplot(aes(Risk_Category,Rate_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(discrete = TRUE) +
+      labs(title = "Risk prediction vs. Kernel density, 2018 thefts") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+## 5. Conclusions
+
+In this project, I developed a risk prediction model on theft prediction in the city of Chicago. A set of spatial features are taken into consideration, including abandoned houses, traffic crashes and so on.
+
+In general, I'd like to recommend my regression model as a reference in police practice. 
+Firstly, my Random k-fold regression model with spatial process reaches a MAE of 1.29, which is a moderate and acceptable error value. Moreover, the comparision with the observed theft data indicates that there is not a big gap between the observed theft cases and predicted theft cases. The result of kernel density analysis further proves that my model prediction result is reliable because the two results are similar in crime rates. And my model performs even slightly better than the traditional kernel density hotspot model. 
+What's more, my model shows a satisfying generalizability in different racial regions. There is no significant difference in mean error between majority white region and non-white region predicted by my spatial LOGO model.
+
+However, there are still some limitations in my model. The problem of selection bias still keeps unsettled in my model, and this would probably cause deviation between the location where thefts truely occur and where they are predicted. Theft is a kind of highly mobile crime, and further studies should be made on precise theft location prediction. 
+
+
+
